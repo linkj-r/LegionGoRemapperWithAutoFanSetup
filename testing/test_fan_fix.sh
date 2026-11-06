@@ -7,6 +7,8 @@
 #   ./test_fan_fix.sh break-keyring     # Phase 2b — simulate uninitialized pacman keyring (requires sudo)
 #   ./test_fan_fix.sh break-headers     # Phase 2c — simulate missing kernel headers (requires sudo)
 #   ./test_fan_fix.sh break-dkms-only   # Phase 2d — remove DKMS registration but keep .ko (requires sudo)
+#   ./test_fan_fix.sh apply             # Run the fix directly from the terminal, bypassing the Decky UI (requires sudo)
+#   ./test_fan_fix.sh cycle             # break-headers-corrupt + break + apply + verify-fix in one go (requires sudo)
 #   ./test_fan_fix.sh break-headers-corrupt # Phase 2e — truncated headers + corrupt pacman entry (requires sudo)
 #   ./test_fan_fix.sh verify-fix        # Phase 3 — confirm plugin fixed it
 #   ./test_fan_fix.sh restore           # Emergency: manually restore without the plugin (requires sudo)
@@ -324,8 +326,64 @@ phase_break_headers_corrupt() {
     warn "To restore headers manually:"
     warn "  sudo steamos-readonly disable"
     warn "  sudo rm -rf ${db_path}local/${pkg}-[0-9]*"
-    warn "  sudo pacman -S --noconfirm --overwrite 'usr/lib/modules/*/build/*' ${pkg}"
+    warn "  sudo pacman -S --noconfirm --overwrite '*' ${pkg}"
     warn "  sudo steamos-readonly enable"
+}
+
+phase_apply() {
+    require_sudo "apply"
+    hdr "Apply Fan Fix (direct, bypasses the Decky UI)"
+
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local modules="${script_dir}/py_modules"
+    [[ -d "$modules" ]] || modules="${script_dir}/../py_modules"
+
+    local rc=0
+    python3 -I - "$modules" <<'PY' || rc=$?
+import logging
+import sys
+import time
+import types
+
+logging.basicConfig(level=logging.INFO, format="  %(message)s")
+sys.modules["decky_plugin"] = types.SimpleNamespace(logger=logging.getLogger("fan_fix"))
+sys.path.insert(0, sys.argv[1])
+import fan_support
+
+started = fan_support.apply_fan_fix()
+if not started["started"]:
+    print("  " + started["error"])
+    sys.exit(1)
+while True:
+    time.sleep(1)
+    progress = fan_support.get_fan_fix_progress()
+    if progress["done"]:
+        break
+if not progress["success"]:
+    print("  FAILED: " + progress["error"])
+    sys.exit(1)
+if progress["reboot_required"]:
+    print("  Reboot required to activate.")
+PY
+
+    echo ""
+    print_status
+    echo ""
+    if [[ $rc -eq 0 ]]; then
+        ok "Fix applied."
+    else
+        fail "Fix failed — see output above."
+        exit 1
+    fi
+}
+
+phase_cycle() {
+    require_sudo "cycle"
+    export SKIP_DECKY_RESTART=1
+    phase_break_headers_corrupt
+    phase_break
+    phase_apply
+    phase_verify_fix
 }
 
 # Phase 2d: remove only the DKMS registration, leaving the .ko in place.
@@ -368,6 +426,7 @@ phase_break_dkms_only() {
 
 _restart_decky_and_prompt() {
     local phase="$1"
+    [[ -n "${SKIP_DECKY_RESTART:-}" ]] && return 0
     info "Restarting Decky to load latest plugin build…"
     systemctl restart plugin_loader
     sleep 3
@@ -486,11 +545,13 @@ case "$PHASE" in
     break-headers)    phase_break_headers ;;
     break-dkms-only)  phase_break_dkms_only ;;
     break-headers-corrupt) phase_break_headers_corrupt ;;
+    apply)            phase_apply ;;
+    cycle)            phase_cycle ;;
     verify-fix)       phase_verify_fix ;;
     restore)          phase_restore ;;
     status)           print_status ;;
     *)
-        echo "Usage: $0 {baseline|break|break-keyring|break-headers|break-dkms-only|break-headers-corrupt|verify-fix|restore|status}"
+        echo "Usage: $0 {baseline|break|break-keyring|break-headers|break-dkms-only|break-headers-corrupt|apply|cycle|verify-fix|restore|status}"
         echo ""
         echo "  baseline          Phase 1: confirm healthy starting state"
         echo "  break             Phase 2: remove DKMS + .ko (requires sudo)"
@@ -498,6 +559,8 @@ case "$PHASE" in
         echo "  break-headers     Phase 2c: remove kernel headers build path (requires sudo)"
         echo "  break-dkms-only   Phase 2d: remove DKMS registration, keep .ko (requires sudo)"
         echo "  break-headers-corrupt Phase 2e: truncate headers tree + corrupt pacman entry (requires sudo)"
+        echo "  apply             Run the fix directly, bypassing the Decky UI (requires sudo)"
+        echo "  cycle             break-headers-corrupt + break + apply + verify-fix (requires sudo)"
         echo "  verify-fix        Phase 3: confirm plugin fix worked"
         echo "  restore           Emergency manual restore (requires sudo)"
         echo "  status            Print current acpi_call / DKMS / headers / keyring state"
