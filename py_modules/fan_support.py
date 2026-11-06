@@ -8,7 +8,9 @@ Uses decky_plugin.logger (available in both plugins' execution context).
 Returns plain Python types; plugin.py wraps them in _ok/_err envelopes as needed.
 """
 
+import glob
 import os
+import shutil
 import subprocess
 import threading
 
@@ -72,10 +74,29 @@ def _get_current_kernel() -> str:
     return stdout if rc == 0 else ""
 
 
-def _pacman_lock_path() -> str:
+def _pacman_db_path() -> str:
     rc, stdout, _ = _run(["pacman-conf", "DBPath"], timeout=10)
-    db_path = stdout if rc == 0 and stdout else "/var/lib/pacman/"
-    return os.path.join(db_path, "db.lck")
+    return stdout if rc == 0 and stdout else "/var/lib/pacman/"
+
+
+def _pacman_lock_path() -> str:
+    return os.path.join(_pacman_db_path(), "db.lck")
+
+
+def _headers_build_dir(kernel: str) -> str:
+    return f"/usr/lib/modules/{kernel}/build"
+
+
+def _headers_complete(kernel: str) -> bool:
+    return os.path.exists(os.path.join(_headers_build_dir(kernel), "scripts", "Kbuild.include"))
+
+
+def _remove_corrupt_local_entries(pkg: str) -> None:
+    local_dir = os.path.join(_pacman_db_path(), "local")
+    for entry in glob.glob(os.path.join(local_dir, f"{pkg}-[0-9]*")):
+        if os.path.isdir(entry) and not os.path.exists(os.path.join(entry, "desc")):
+            decky_plugin.logger.warning("fan_support: removing corrupt pacman entry %s", entry)
+            shutil.rmtree(entry, ignore_errors=True)
 
 
 def _pacman_running() -> bool:
@@ -172,36 +193,24 @@ def _apply_fan_fix_worker() -> None:
         # ── Step 3: Install kernel headers ────────────────────────────────────
         # Valve publishes per-series headers packages: linux-neptune-611-headers
         # for 6.11.x, linux-neptune-68-headers for 6.8.x, etc.
-        # Derive the series suffix from the running kernel's major.minor and try
-        # that package first before falling back to the legacy linux-neptune-headers
-        # (which is stuck at 5.13 and never matches modern SteamOS kernels).
+        # Derive the series suffix from the running kernel's major.minor.
         _set_progress(f"Installing kernel headers for {kernel}\u2026")
         try:
             parts = kernel.split(".")
             series = parts[0] + parts[1]   # "6" + "11" → "611"
             versioned_pkg = f"linux-neptune-{series}-headers"
         except (IndexError, ValueError):
-            versioned_pkg = None
+            raise RuntimeError(f"Could not derive headers package for kernel {kernel}.")
 
-        rc = 1
-        errors = []
-        if versioned_pkg:
-            rc, _, stderr = _run(
-                ["pacman", "-S", "--noconfirm", versioned_pkg],
-                timeout=180,
-            )
-            if rc != 0:
-                errors.append(f"{versioned_pkg}: {stderr}")
+        _remove_corrupt_local_entries(versioned_pkg)
+        cmd = ["pacman", "-S", "--noconfirm"]
+        if os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel):
+            cmd += ["--overwrite", "usr/lib/modules/*/build/*"]
+        rc, _, stderr = _run(cmd + [versioned_pkg], timeout=180)
         if rc != 0:
-            _set_progress("Trying generic linux-neptune-headers\u2026")
-            rc, _, stderr = _run(
-                ["pacman", "-S", "--noconfirm", "linux-neptune-headers"],
-                timeout=180,
-            )
-            if rc != 0:
-                errors.append(f"linux-neptune-headers: {stderr}")
-        if rc != 0:
-            raise RuntimeError("Kernel headers install failed: " + " | ".join(errors))
+            raise RuntimeError(f"Kernel headers install failed ({versioned_pkg}): {stderr}")
+        if os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel):
+            raise RuntimeError(f"Kernel headers for {kernel} are incomplete after reinstall.")
 
         # ── Step 4: Install DKMS + acpi_call-dkms ─────────────────────────────
         _set_progress("Installing dkms and acpi_call-dkms\u2026")
