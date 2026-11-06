@@ -1,7 +1,9 @@
 import { ModalRoot } from 'decky-frontend-lib';
-import { useState, VFC } from 'react';
+import { useEffect, useState, VFC } from 'react';
 import { FaFan } from 'react-icons/fa';
 import { getServerApi } from '../../backend/utils';
+
+const RESTART_COUNTDOWN_SECONDS = 5;
 
 interface FanRestartModalProps {
   closeModal?: () => void;
@@ -10,12 +12,23 @@ interface FanRestartModalProps {
 
 const FanRestartModal: VFC<FanRestartModalProps> = ({ closeModal, rebootRequired = false }) => {
   const [restarting, setRestarting] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(RESTART_COUNTDOWN_SECONDS);
 
   const handleAction = () => {
     setRestarting(true);
     const method = rebootRequired ? 'reboot_device' : 'restart_decky';
     setTimeout(() => getServerApi()?.callPluginMethod(method, {}), 300);
   };
+
+  useEffect(() => {
+    if (rebootRequired || restarting) return;
+    if (secondsLeft <= 0) {
+      handleAction();
+      return;
+    }
+    const timer = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
+    return () => clearTimeout(timer);
+  }, [secondsLeft, restarting, rebootRequired]);
 
   return (
     <ModalRoot closeModal={closeModal}>
@@ -28,7 +41,7 @@ const FanRestartModal: VFC<FanRestartModalProps> = ({ closeModal, rebootRequired
       <div style={{ fontSize: '13px', color: '#a09070', lineHeight: 1.6, marginBottom: '24px' }}>
         {rebootRequired
           ? 'Fan support has been installed. The kernel module could not be loaded immediately — this usually means SteamOS has a pending update. Reboot your device to activate fan controls.'
-          : 'Fan support has been restored. Restart Decky to activate fan controls immediately, or reboot your device at any time.'}
+          : <>Fan support has been restored. Decky will restart in <strong>{secondsLeft}s</strong> to activate fan controls. Press Later to cancel.</>}
       </div>
 
       {restarting ? (
@@ -66,7 +79,7 @@ const FanRestartModal: VFC<FanRestartModalProps> = ({ closeModal, rebootRequired
               border: '1px solid rgba(200,168,75,0.5)', borderRadius: '4px',
             }}
           >
-            {rebootRequired ? 'Reboot Now' : 'Restart Decky'}
+            {rebootRequired ? 'Reboot Now' : `Restart Now (${secondsLeft}s)`}
           </button>
         </div>
       )}

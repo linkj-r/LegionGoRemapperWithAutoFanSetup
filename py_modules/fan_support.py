@@ -8,7 +8,9 @@ Uses decky_plugin.logger (available in both plugins' execution context).
 Returns plain Python types; plugin.py wraps them in _ok/_err envelopes as needed.
 """
 
+import glob
 import os
+import shutil
 import subprocess
 import threading
 
@@ -72,6 +74,52 @@ def _get_current_kernel() -> str:
     return stdout if rc == 0 else ""
 
 
+def _pacman_db_path() -> str:
+    rc, stdout, _ = _run(["pacman-conf", "DBPath"], timeout=10)
+    return stdout if rc == 0 and stdout else "/var/lib/pacman/"
+
+
+def _pacman_lock_path() -> str:
+    return os.path.join(_pacman_db_path(), "db.lck")
+
+
+def _headers_build_dir(kernel: str) -> str:
+    return f"/usr/lib/modules/{kernel}/build"
+
+
+def _headers_complete(kernel: str) -> bool:
+    return os.path.exists(os.path.join(_headers_build_dir(kernel), "scripts", "Kbuild.include"))
+
+
+def _remove_corrupt_local_entries(pkg: str) -> bool:
+    removed = False
+    local_dir = os.path.join(_pacman_db_path(), "local")
+    for entry in glob.glob(os.path.join(local_dir, f"{pkg}-[0-9]*")):
+        if os.path.isdir(entry) and not os.path.exists(os.path.join(entry, "desc")):
+            decky_plugin.logger.warning("fan_support: removing corrupt pacman entry %s", entry)
+            shutil.rmtree(entry, ignore_errors=True)
+            removed = True
+    return removed
+
+
+def _pacman_running() -> bool:
+    rc, _, _ = _run(["pgrep", "-x", "pacman"], timeout=5)
+    return rc == 0
+
+
+def _clear_stale_pacman_lock() -> None:
+    lock = _pacman_lock_path()
+    if not os.path.exists(lock):
+        return
+    if _pacman_running():
+        raise RuntimeError("Another pacman process is running; try again once it finishes.")
+    decky_plugin.logger.warning("fan_support: removing stale pacman lock %s", lock)
+    try:
+        os.remove(lock)
+    except OSError as exc:
+        raise RuntimeError(f"Could not remove stale pacman lock {lock}: {exc}") from exc
+
+
 def _is_kernel_supported(kernel: str):
     """
     Check whether acpi_call DKMS is built and active for the given kernel string.
@@ -119,6 +167,8 @@ def _apply_fan_fix_worker() -> None:
         if rc != 0:
             raise RuntimeError(f"steamos-readonly disable failed: {stderr}")
 
+        _clear_stale_pacman_lock()
+
         # ── Step 2: Initialize pacman keyring (if not already done) ──────────
         # On SteamOS the pacman keyring is sometimes absent or non-writable,
         # causing all subsequent pacman installs to fail with
@@ -146,31 +196,24 @@ def _apply_fan_fix_worker() -> None:
         # ── Step 3: Install kernel headers ────────────────────────────────────
         # Valve publishes per-series headers packages: linux-neptune-611-headers
         # for 6.11.x, linux-neptune-68-headers for 6.8.x, etc.
-        # Derive the series suffix from the running kernel's major.minor and try
-        # that package first before falling back to the legacy linux-neptune-headers
-        # (which is stuck at 5.13 and never matches modern SteamOS kernels).
+        # Derive the series suffix from the running kernel's major.minor.
         _set_progress(f"Installing kernel headers for {kernel}\u2026")
         try:
             parts = kernel.split(".")
             series = parts[0] + parts[1]   # "6" + "11" → "611"
             versioned_pkg = f"linux-neptune-{series}-headers"
         except (IndexError, ValueError):
-            versioned_pkg = None
+            raise RuntimeError(f"Could not derive headers package for kernel {kernel}.")
 
-        rc = 1
-        if versioned_pkg:
-            rc, _, stderr = _run(
-                ["pacman", "-S", "--noconfirm", versioned_pkg],
-                timeout=180,
-            )
+        removed_entry = _remove_corrupt_local_entries(versioned_pkg)
+        cmd = ["pacman", "-S", "--noconfirm"]
+        if removed_entry or (os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel)):
+            cmd += ["--overwrite", "*"]
+        rc, _, stderr = _run(cmd + [versioned_pkg], timeout=180)
         if rc != 0:
-            _set_progress("Trying generic linux-neptune-headers\u2026")
-            rc, _, stderr = _run(
-                ["pacman", "-S", "--noconfirm", "linux-neptune-headers"],
-                timeout=180,
-            )
-        if rc != 0:
-            raise RuntimeError(f"Kernel headers install failed: {stderr}")
+            raise RuntimeError(f"Kernel headers install failed ({versioned_pkg}): {stderr}")
+        if os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel):
+            raise RuntimeError(f"Kernel headers for {kernel} are incomplete after reinstall.")
 
         # ── Step 4: Install DKMS + acpi_call-dkms ─────────────────────────────
         _set_progress("Installing dkms and acpi_call-dkms\u2026")
@@ -322,12 +365,13 @@ def reboot_device() -> bool:
 
 def restart_decky() -> bool:
     """
-    Kills the PluginLoader process so systemd restarts it, reloading all
-    plugins immediately.  pkill exit code 1 means no process matched, which
-    is treated as success (already restarting).
+    Restarts plugin_loader through systemd so plugin processes are stopped
+    cleanly.  Killing the PluginLoader process directly leaves them orphaned.
     """
-    rc, _, stderr = _run(["/usr/bin/pkill", "-f", "PluginLoader"], timeout=5)
-    if rc not in (0, 1):
+    rc, _, stderr = _run(
+        ["/usr/bin/systemctl", "restart", "--no-block", "plugin_loader"], timeout=10
+    )
+    if rc != 0:
         decky_plugin.logger.error("fan_support: restart_decky failed: %s", stderr)
         return False
     return True
