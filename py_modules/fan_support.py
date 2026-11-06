@@ -91,12 +91,15 @@ def _headers_complete(kernel: str) -> bool:
     return os.path.exists(os.path.join(_headers_build_dir(kernel), "scripts", "Kbuild.include"))
 
 
-def _remove_corrupt_local_entries(pkg: str) -> None:
+def _remove_corrupt_local_entries(pkg: str) -> bool:
+    removed = False
     local_dir = os.path.join(_pacman_db_path(), "local")
     for entry in glob.glob(os.path.join(local_dir, f"{pkg}-[0-9]*")):
         if os.path.isdir(entry) and not os.path.exists(os.path.join(entry, "desc")):
             decky_plugin.logger.warning("fan_support: removing corrupt pacman entry %s", entry)
             shutil.rmtree(entry, ignore_errors=True)
+            removed = True
+    return removed
 
 
 def _pacman_running() -> bool:
@@ -202,10 +205,10 @@ def _apply_fan_fix_worker() -> None:
         except (IndexError, ValueError):
             raise RuntimeError(f"Could not derive headers package for kernel {kernel}.")
 
-        _remove_corrupt_local_entries(versioned_pkg)
+        removed_entry = _remove_corrupt_local_entries(versioned_pkg)
         cmd = ["pacman", "-S", "--noconfirm"]
-        if os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel):
-            cmd += ["--overwrite", "usr/lib/modules/*/build/*"]
+        if removed_entry or (os.path.isdir(_headers_build_dir(kernel)) and not _headers_complete(kernel)):
+            cmd += ["--overwrite", "*"]
         rc, _, stderr = _run(cmd + [versioned_pkg], timeout=180)
         if rc != 0:
             raise RuntimeError(f"Kernel headers install failed ({versioned_pkg}): {stderr}")
@@ -362,12 +365,13 @@ def reboot_device() -> bool:
 
 def restart_decky() -> bool:
     """
-    Kills the PluginLoader process so systemd restarts it, reloading all
-    plugins immediately.  pkill exit code 1 means no process matched, which
-    is treated as success (already restarting).
+    Restarts plugin_loader through systemd so plugin processes are stopped
+    cleanly.  Killing the PluginLoader process directly leaves them orphaned.
     """
-    rc, _, stderr = _run(["/usr/bin/pkill", "-f", "PluginLoader"], timeout=5)
-    if rc not in (0, 1):
+    rc, _, stderr = _run(
+        ["/usr/bin/systemctl", "restart", "--no-block", "plugin_loader"], timeout=10
+    )
+    if rc != 0:
         decky_plugin.logger.error("fan_support: restart_decky failed: %s", stderr)
         return False
     return True

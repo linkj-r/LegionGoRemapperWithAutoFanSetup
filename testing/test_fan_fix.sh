@@ -7,6 +7,7 @@
 #   ./test_fan_fix.sh break-keyring     # Phase 2b — simulate uninitialized pacman keyring (requires sudo)
 #   ./test_fan_fix.sh break-headers     # Phase 2c — simulate missing kernel headers (requires sudo)
 #   ./test_fan_fix.sh break-dkms-only   # Phase 2d — remove DKMS registration but keep .ko (requires sudo)
+#   ./test_fan_fix.sh break-headers-corrupt # Phase 2e — truncated headers + corrupt pacman entry (requires sudo)
 #   ./test_fan_fix.sh verify-fix        # Phase 3 — confirm plugin fixed it
 #   ./test_fan_fix.sh restore           # Emergency: manually restore without the plugin (requires sudo)
 #   ./test_fan_fix.sh status            # Print raw diagnostic state at any time
@@ -39,6 +40,11 @@ ko_present() {
 headers_present() {
     local kernel; kernel=$(uname -r)
     [[ -d "/usr/lib/modules/${kernel}/build" ]]
+}
+
+headers_complete() {
+    local kernel; kernel=$(uname -r)
+    [[ -f "/usr/lib/modules/${kernel}/build/scripts/Kbuild.include" ]]
 }
 
 keyring_ok() {
@@ -91,6 +97,14 @@ print_status() {
         ok "Kernel headers build path present for ${kernel}"
     else
         warn "Kernel headers build path absent for ${kernel}"
+    fi
+
+    if headers_present; then
+        if headers_complete; then
+            ok "Kernel headers tree is complete (scripts/Kbuild.include present)"
+        else
+            fail "Kernel headers tree is incomplete (scripts/Kbuild.include missing)"
+        fi
     fi
 
     if keyring_ok; then
@@ -265,6 +279,55 @@ phase_break_headers() {
     warn "  sudo steamos-readonly enable"
 }
 
+phase_break_headers_corrupt() {
+    require_sudo "break-headers-corrupt"
+    hdr "Phase 2e — Simulate Truncated Headers With Corrupt pacman Entry"
+
+    local kernel; kernel=$(uname -r)
+    local pkg; pkg=$(neptune_headers_pkg)
+    local build_path="/usr/lib/modules/${kernel}/build"
+    local db_path; db_path=$(pacman-conf DBPath)
+    db_path="${db_path%/}/"
+
+    if ! headers_present; then
+        warn "Headers build path absent for ${kernel} — nothing to truncate."
+        print_status
+        exit 0
+    fi
+
+    info "Disabling read-only filesystem…"
+    steamos-readonly disable
+
+    info "Truncating the headers tree (removing ${build_path}/scripts)…"
+    rm -rf "${build_path}/scripts"
+    ok "Headers tree truncated."
+
+    local entry
+    for entry in "${db_path}local/${pkg}-"[0-9]*/; do
+        [[ -d "$entry" ]] || continue
+        info "Corrupting pacman entry ${entry} (removing desc and files)…"
+        rm -f "${entry}desc" "${entry}files"
+        ok "Entry now holds only: $(ls "$entry" | tr '\n' ' ')"
+    done
+
+    info "Re-enabling read-only filesystem…"
+    steamos-readonly enable
+
+    echo ""
+    print_status
+    echo ""
+    ok "Corrupt-headers state set."
+    warn "NOTE: Run 'sudo bash $0 break' first so fan support is also reported missing."
+    warn "ACTION: Apply the fix via LegionFanFix in Decky, then:"
+    warn "        ./test_fan_fix.sh verify-fix"
+    echo ""
+    warn "To restore headers manually:"
+    warn "  sudo steamos-readonly disable"
+    warn "  sudo rm -rf ${db_path}local/${pkg}-[0-9]*"
+    warn "  sudo pacman -S --noconfirm --overwrite 'usr/lib/modules/*/build/*' ${pkg}"
+    warn "  sudo steamos-readonly enable"
+}
+
 # Phase 2d: remove only the DKMS registration, leaving the .ko in place.
 # Tests whether the fix handles the case where DKMS thinks the module is
 # not installed but the .ko file still exists (e.g. after dkms database
@@ -306,7 +369,7 @@ phase_break_dkms_only() {
 _restart_decky_and_prompt() {
     local phase="$1"
     info "Restarting Decky to load latest plugin build…"
-    pkill -f "PluginLoader" 2>/dev/null || true
+    systemctl restart plugin_loader
     sleep 3
     ok "Decky restarted."
     echo ""
@@ -422,17 +485,19 @@ case "$PHASE" in
     break-keyring)    phase_break_keyring ;;
     break-headers)    phase_break_headers ;;
     break-dkms-only)  phase_break_dkms_only ;;
+    break-headers-corrupt) phase_break_headers_corrupt ;;
     verify-fix)       phase_verify_fix ;;
     restore)          phase_restore ;;
     status)           print_status ;;
     *)
-        echo "Usage: $0 {baseline|break|break-keyring|break-headers|break-dkms-only|verify-fix|restore|status}"
+        echo "Usage: $0 {baseline|break|break-keyring|break-headers|break-dkms-only|break-headers-corrupt|verify-fix|restore|status}"
         echo ""
         echo "  baseline          Phase 1: confirm healthy starting state"
         echo "  break             Phase 2: remove DKMS + .ko (requires sudo)"
         echo "  break-keyring     Phase 2b: corrupt pacman keyring (requires sudo)"
         echo "  break-headers     Phase 2c: remove kernel headers build path (requires sudo)"
         echo "  break-dkms-only   Phase 2d: remove DKMS registration, keep .ko (requires sudo)"
+        echo "  break-headers-corrupt Phase 2e: truncate headers tree + corrupt pacman entry (requires sudo)"
         echo "  verify-fix        Phase 3: confirm plugin fix worked"
         echo "  restore           Emergency manual restore (requires sudo)"
         echo "  status            Print current acpi_call / DKMS / headers / keyring state"
