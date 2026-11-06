@@ -72,6 +72,30 @@ def _get_current_kernel() -> str:
     return stdout if rc == 0 else ""
 
 
+def _pacman_lock_path() -> str:
+    rc, stdout, _ = _run(["pacman-conf", "DBPath"], timeout=10)
+    db_path = stdout if rc == 0 and stdout else "/var/lib/pacman/"
+    return os.path.join(db_path, "db.lck")
+
+
+def _pacman_running() -> bool:
+    rc, _, _ = _run(["pgrep", "-x", "pacman"], timeout=5)
+    return rc == 0
+
+
+def _clear_stale_pacman_lock() -> None:
+    lock = _pacman_lock_path()
+    if not os.path.exists(lock):
+        return
+    if _pacman_running():
+        raise RuntimeError("Another pacman process is running; try again once it finishes.")
+    decky_plugin.logger.warning("fan_support: removing stale pacman lock %s", lock)
+    try:
+        os.remove(lock)
+    except OSError as exc:
+        raise RuntimeError(f"Could not remove stale pacman lock {lock}: {exc}") from exc
+
+
 def _is_kernel_supported(kernel: str):
     """
     Check whether acpi_call DKMS is built and active for the given kernel string.
@@ -119,6 +143,8 @@ def _apply_fan_fix_worker() -> None:
         if rc != 0:
             raise RuntimeError(f"steamos-readonly disable failed: {stderr}")
 
+        _clear_stale_pacman_lock()
+
         # ── Step 2: Initialize pacman keyring (if not already done) ──────────
         # On SteamOS the pacman keyring is sometimes absent or non-writable,
         # causing all subsequent pacman installs to fail with
@@ -158,19 +184,24 @@ def _apply_fan_fix_worker() -> None:
             versioned_pkg = None
 
         rc = 1
+        errors = []
         if versioned_pkg:
             rc, _, stderr = _run(
                 ["pacman", "-S", "--noconfirm", versioned_pkg],
                 timeout=180,
             )
+            if rc != 0:
+                errors.append(f"{versioned_pkg}: {stderr}")
         if rc != 0:
             _set_progress("Trying generic linux-neptune-headers\u2026")
             rc, _, stderr = _run(
                 ["pacman", "-S", "--noconfirm", "linux-neptune-headers"],
                 timeout=180,
             )
+            if rc != 0:
+                errors.append(f"linux-neptune-headers: {stderr}")
         if rc != 0:
-            raise RuntimeError(f"Kernel headers install failed: {stderr}")
+            raise RuntimeError("Kernel headers install failed: " + " | ".join(errors))
 
         # ── Step 4: Install DKMS + acpi_call-dkms ─────────────────────────────
         _set_progress("Installing dkms and acpi_call-dkms\u2026")
